@@ -12,3 +12,7 @@
 
 # All store files 
 *.DS_Store
+
+# logs/state
+agent.log
+state.json

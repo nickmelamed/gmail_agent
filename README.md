@@ -42,13 +42,19 @@ A DRY_RUN mode is available to test without creating drafts.
 ## Repository structure
 
 ```text
-daily_inbox_agent/
+main_files
 ├── agent.py            # Main agent logic
 ├── setup.sh            # One-command local setup
 ├── requirements.txt    # Python dependencies
 ├── README.md           # This file
 ├── profile.txt         # User fact profile (safe to commit)
 ├── .env.example        # Environment variable template (safe to commit)
+
+# web-run 
+├── app.py # Flask-based UI 
+├── Procfile # for auto-start 
+├── requirements.txt # for web 
+├── Dockerfile # pinning Python version for Cohere  
 
 # Local-only (NOT committed):
 ├── credentials.json    # Google OAuth client secrets
@@ -57,16 +63,95 @@ daily_inbox_agent/
 ├── state.json          # Local run state
 ```
 
-## Requirements
+## Web setup 
+
+There is a web version of this where you only need to set up the OAuth to utilize this service. 
+
+
+### Architecture Overview
+
+- Flask web app (`web/app.py`)
+- Google OAuth (Web Application client)
+- Firestore (token storage)
+- Cohere API (server-side inference)
+- Cloud Run (container hosting)
+
+---
+
+### User Cloud Run 
+
+Click on the following link: 
+
+https://gmail-agent-1029211064550.us-central1.run.app
+
+And approve the usage on your Gmail account when prompted to log in. 
+
+---
+
+### Web Setup for Devs 
+
+If you are interested in reproducing this work, follow the below steps.
+
+#### Prerequisites
+
+- Flask web app (`web/app.py`)
+- Google OAuth (Web Application client)
+- Firestore (token storage)
+- Cohere API (server-side inference)
+- Cloud Run (container hosting)
+
+#### OAuth Configuration 
+
+After deployment, add this to your OAuth Client:
+
+**Authorized JavaScript origins**
+https://gmail-agent-1029211064550.us-central1.run.app
+
+**Authorized redirect URIs**
+https://gmail-agent-1029211064550.us-central1.run.app
+
+#### Deploy to Cloud Run 
+
+Run this line: 
+
+```bash
+gcloud run deploy gmail-agent \
+  --source ./web \
+  --region us-central1 \
+  --allow-unauthenticated
+```
+
+After deployment, use the URL that is outputted in this format `https://gmail-agent-xxxxx-uc.a.run.app` in your OAuth settings. 
+
+#### Environment Variables 
+
+Go to Cloud Run --> Edit and Deploy New Revision --> Variables and Secrets and set the following keys: 
+- FLASK_SECRET_KEY 
+- COHERE_API_KEY
+- GOOGLE_OAUTH_CLIENT_JSON 
+
+You should store these in Secret Manager for easy access. 
+
+#### Firestore Setup 
+
+1. Go to Firestore in Google Cloud Console 
+2. Create database in Native mode
+3. Ensure the Cloud Run service account has permission to read/write Firestone (recommended role: Cloud Datastore User)
+
+#### Test 
+
+Visit `https://YOUR_CLOUD_RUN_URL/` and sign in, then go to `/run` for it to work. You can then go to Gmail to check that the drafts are present in your inbox. 
+
+## Local setup
+
+If you prefer to run this locally, you can do so but will need to have a few extra steps to ensure the agent can run. 
+
+### Requirements
 
 - Python 3.10+
 - A Google account with Gmail
 - A Google Cloud project with the Gmail API enabled
 - A Cohere API key
-
----
-
-## Local setup
 
 ### Clone the repository
 

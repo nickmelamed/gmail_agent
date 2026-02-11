@@ -1,0 +1,14 @@
+# OAuth / secrets
+*credentials.json
+*token.json
+*.env
+
+# Python
+*__pycache__/
+*.venv/
+
+# Checkpoint files 
+*.ipynb_checkpoints 
+
+# All store files 
+*.DS_Store

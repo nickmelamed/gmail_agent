@@ -1,0 +1,5 @@
+Name: Nick Melamed 
+Role: Graduate student at UC Berkeley
+Tone: Concise, professional, friendly
+Default availability: Weekdays after 5pm
+Signature: Nick Melamed

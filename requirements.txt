@@ -1,10 +1,7 @@
-Flask==3.0.3
-gunicorn==22.0.0
 python-dotenv==1.0.1
 
 google-api-python-client==2.154.0
 google-auth==2.36.0
 google-auth-oauthlib==1.2.1
 
-google-cloud-firestore==2.16.1
 cohere==5.8.1

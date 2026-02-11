@@ -9,8 +9,10 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.cloud import firestore
 from email.message import EmailMessage
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
 
 SCOPES = [

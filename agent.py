@@ -12,11 +12,12 @@ from googleapiclient.discovery import build
 
 import cohere
 
+# Load .env if present (local dev / teammate setup)
 load_dotenv()
 
 # Gmail scopes
-## Read Only: list/get messages 
-## Compose: Write an email 
+## Read Only: list/get messages
+## Compose: Create drafts
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
@@ -24,6 +25,13 @@ SCOPES = [
 
 STATE_PATH = "state.json"
 PROFILE_PATH = "profile.txt"
+
+# Configurable credential path (recommended so credentials can live outside repo)
+CREDS_PATH = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "credentials.json")
+
+# (Optional) dry-run mode (do not create drafts; just print what would happen)
+# Supports: export DRY_RUN=1 (or true/yes/on)
+DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def load_profile(path: str = PROFILE_PATH) -> str:
@@ -34,15 +42,22 @@ def load_profile(path: str = PROFILE_PATH) -> str:
 def gmail_service():
     """
     Auth flow:
-    - credentials.json: OAuth client secrets downloaded from Google Cloud
-    - token.json: stored user token after first run
+    - credentials.json: OAuth client secrets downloaded from Google Cloud (NOT committed)
+    - token.json: stored user token after first run (NOT committed)
     """
+    if not os.path.exists(CREDS_PATH):
+        raise FileNotFoundError(
+            f"Missing Google OAuth credentials file at: {CREDS_PATH}\n"
+            "Download OAuth Desktop credentials from Google Cloud Console and place it there, "
+            "or set GOOGLE_OAUTH_CREDENTIALS to the file path."
+        )
+
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
         creds = flow.run_local_server(port=0)
         with open("token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
@@ -70,17 +85,27 @@ def list_unread_messages(service, max_results: int = 10):
     You can tune this based on your needs.
     """
     query = "is:unread newer_than:1d"
-    resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+    resp = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query, maxResults=max_results)
+        .execute()
+    )
     return resp.get("messages", [])
 
 
 def get_message_details(service, msg_id: str) -> dict:
-    msg = service.users().messages().get(
-        userId="me",
-        id=msg_id,
-        format="metadata",
-        metadataHeaders=["From", "To", "Subject", "Date", "Message-Id"],
-    ).execute()
+    msg = (
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=msg_id,
+            format="metadata",
+            metadataHeaders=["From", "To", "Subject", "Date", "Message-Id"],
+        )
+        .execute()
+    )
 
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
     snippet = msg.get("snippet", "")
@@ -100,7 +125,7 @@ def get_message_details(service, msg_id: str) -> dict:
 def heuristic_importance(email: dict) -> int:
     """
     Baseline heuristic ranking of an email.
-    Used in event of failure of LLM ranking 
+    Used in event of failure of LLM ranking
     """
     score = 10
     subj = (email.get("subject") or "").lower()
@@ -129,11 +154,11 @@ def llm_rank_and_reply(cohere_client: cohere.Client, fact_profile: str, email: d
       }
     """
     prompt = f"""
-        "You are an email triage and drafting assistant. "
-        "You must be concise, professional, and safe. "
-        "Never invent commitments (dates, payments, promises). "
-        "If unclear, ask 1-2 short clarifying questions in the reply."
-  
+You are an email triage and drafting assistant.
+You must be concise, professional, and safe.
+Never invent commitments (dates, payments, promises).
+If unclear, ask 1-2 short clarifying questions in the reply.
+
 USER FACT PROFILE:
 {fact_profile}
 
@@ -147,15 +172,15 @@ TASK:
 1) Rate importance from 0-100.
 2) Assign a category (e.g., 'school', 'work', 'robotics', 'admin', 'spam-like').
 3) Draft a reply the user can review and send.
+
 Output STRICT JSON with keys:
 importance (int), category (str), reply_subject (str), reply_body (str)
 """
 
-    
     response = cohere_client.chat(
-        model="command-r-08-2024", # best cohere model for email generation 
+        model="command-r-08-2024",
         message=prompt,
-        temperature=0.2, # want some variability in repsonse, not much
+        temperature=0.2,
     )
 
     text = response.text.strip()
@@ -212,6 +237,8 @@ def main():
 
     cohere_key = os.getenv("COHERE_API_KEY")
     cohere_client = cohere.Client(cohere_key) if cohere_key else None
+    if not cohere_key:
+        print("Warning: COHERE_API_KEY is not set. Falling back to heuristic ranking + generic replies.")
 
     msgs = list_unread_messages(service, max_results=10)
     if not msgs:
@@ -240,12 +267,21 @@ def main():
 
         to_email = parse_from_header(e["from"])
 
-        draft = create_draft(
-            service=service,
-            to_email=to_email,
-            subject=reply_subject,
-            body=reply_body,
-        )
+        if DRY_RUN:
+            draft_id = None
+            print("\n--- DRY RUN (no draft created) ---")
+            print(f"To: {to_email}")
+            print(f"Subject: {reply_subject}")
+            print(f"Category: {category} | Importance: {importance}")
+            print(f"Body:\n{reply_body}\n")
+        else:
+            draft = create_draft(
+                service=service,
+                to_email=to_email,
+                subject=reply_subject,
+                body=reply_body,
+            )
+            draft_id = draft.get("id")
 
         results.append(
             {
@@ -253,15 +289,23 @@ def main():
                 "subject": e["subject"],
                 "importance": importance,
                 "category": category,
-                "draft_id": draft.get("id"),
+                "draft_id": draft_id,
             }
         )
 
     # Sort + print summary
     results.sort(key=lambda x: x["importance"], reverse=True)
-    print("\n=== Drafts Created (highest importance first) ===")
+
+    if DRY_RUN:
+        print("\n=== DRY RUN SUMMARY (highest importance first) ===")
+    else:
+        print("\n=== Drafts Created (highest importance first) ===")
+
     for r in results:
-        print(f'[{r["importance"]:>3}] ({r["category"]}) {r["subject"]}  <-- {r["from"]}   draft={r["draft_id"]}')
+        draft_str = f"draft={r['draft_id']}" if r["draft_id"] else "draft=(none)"
+        print(
+            f'[{r["importance"]:>3}] ({r["category"]}) {r["subject"]}  <-- {r["from"]}   {draft_str}'
+        )
 
     state["last_run_utc"] = datetime.now(timezone.utc).isoformat()
     save_state(state)

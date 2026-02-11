@@ -1,6 +1,6 @@
 # Daily Gmail Inbox Checking Agent (Proof of Concept)
 
-This repository contains a local, human-in-the-loop AI agent that checks a Gmail inbox, prioritizes unread emails, and generates draft replies using an LLM (Cohere).
+This repository contains a local, human-in-the-loop AI agent that prioritizes unread emails and generates draft replies using an LLM (Cohere).
 
 The goal is to reduce inbox time by automating your email-checking experience into a simple review-and-send workflow. 
 
@@ -28,17 +28,14 @@ A DRY_RUN mode is available to test without creating drafts.
 ### Why Gmail Drafts (not auto-send)?
 - Prevents accidental or incorrect replies
 - Keeps a human in the loop
-- Makes the system safe for real inboxes
 
 ### Why a user fact profile?
 - Allows personalization without hard-coding logic
-- Easy to edit and reason about
 - Mimics how a real assistant would use user context
 
 ### Why heuristics + LLM?
 - Heuristics provide a safe fallback
 - LLM improves prioritization and reply quality
-- The system still works if the LLM is unavailable
 
 ---
 

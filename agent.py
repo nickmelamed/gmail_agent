@@ -153,7 +153,7 @@ importance (int), category (str), reply_subject (str), reply_body (str)
 
     
     response = cohere_client.chat(
-        model="command-r-plus", # best cohere model for email generation 
+        model="command-r-08-2024", # best cohere model for email generation 
         message=prompt,
         temperature=0.2, # want some variability in repsonse, not much
     )

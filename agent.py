@@ -228,23 +228,121 @@ def _parsed_date(email_date: str) -> Optional[datetime]:
 
 def heuristic_importance(email: dict) -> int:
     """
-    Baseline heuristic ranking of an email.
-    Used in event of failure of LLM ranking
-    """
-    score = 10
-    subj = (email.get("subject") or "").lower()
-    sender = (email.get("from") or "").lower()
+    Robust baseline heuristic importance score (0-100).
+    Designed to be a strong fallback if the LLM fails.
 
-    if any(w in subj for w in ["urgent", "asap", "immediately", "action required"]):
-        score += 40
-    if any(w in subj for w in ["invoice", "payment", "overdue", "receipt"]):
+    Signals used (metadata-only):
+    - Urgency/action keywords
+    - Finance/invoice/payment/legal
+    - Scheduling/meeting/interview
+    - Security/auth/verification codes
+    - Bulk/list email indicators (List-Unsubscribe, Precedence, noreply, etc.)
+    - Sender relationship cues (reply-to present, personal email providers, etc.)
+    - Recency (hours since received)
+    - Thread/reply prefixes
+    - Length-ish via snippet length
+    """
+    subj = (email.get("subject") or "").strip()
+    subj_l = subj.lower()
+    sender = (email.get("from") or "")
+    sender_l = sender.lower()
+    snippet = (email.get("snippet") or "")
+    snippet_l = snippet.lower()
+    domain = _sender_domain(sender)
+
+    # Start relatively low for potential for up/down adjustments
+    score = 35
+
+    # Downrank bulk/spam-like patterns 
+    bulk_hits = 0
+    if "list-unsubscribe" in (email.get("list_unsubscribe") or "").lower():
+        bulk_hits += 2
+    if any(k in (email.get("precedence") or "").lower() for k in ["bulk", "list", "junk"]):
+        bulk_hits += 2
+    if any(k in (email.get("auto_submitted") or "").lower() for k in ["auto", "generated"]):
+        bulk_hits += 1
+    if any(k in sender_l for k in ["no-reply", "noreply", "donotreply"]):
+        bulk_hits += 2
+    if any(k in domain for k in ["mail.", "mailer.", "news.", "marketing.", "bounce."]):
+        bulk_hits += 1
+
+    # Promotional language
+    if any(k in subj_l for k in ["sale", "deal", "promo", "promotion", "newsletter", "unsubscribe"]):
+        bulk_hits += 1
+
+    if bulk_hits >= 4:
+        score -= 35
+    elif bulk_hits == 3:
+        score -= 25
+    elif bulk_hits == 2:
+        score -= 15
+    elif bulk_hits == 1:
+        score -= 8
+
+    # Uprank urgency (e.g., "Action Required")
+    if any(w in subj_l for w in ["urgent", "asap", "immediately", "action required", "time sensitive", "final notice"]):
+        score += 28
+    if any(w in snippet_l for w in ["action required", "please respond", "need your response", "reply by", "deadline"]):
+        score += 12
+
+    # Uprank Financial/Legal
+    if any(w in subj_l for w in ["invoice", "payment", "overdue", "receipt", "bill", "past due", "wire", "refund"]):
+        score += 22
+    if any(w in subj_l for w in ["contract", "agreement", "legal", "nda", "tax", "1099", "w-2"]):
+        score += 18
+    if any(w in snippet_l for w in ["amount due", "past due", "suspension", "collections"]):
+        score += 10
+
+    # Uprank Scheduling/Meeting/Interview
+    if any(w in subj_l for w in ["meeting", "calendar", "schedule", "reschedule", "interview", "availability", "call"]):
+        score += 16
+    if any(w in snippet_l for w in ["zoom", "google meet", "teams", "calendar invite"]):
+        score += 8
+
+    # Security/Verification 
+    # These are often important but not reply-worthy; still high importance so user sees them.
+    if any(w in subj_l for w in ["verification code", "security alert", "password reset", "new sign-in", "suspicious"]):
         score += 25
-    if any(w in sender for w in ["boss@", "advisor@", "prof@", "principal@"]):
+    if re.search(r"\b\d{6}\b", snippet) and any(w in snippet_l for w in ["code", "verification", "otp", "2fa"]):
         score += 20
-    if len(email.get("snippet", "")) > 200:
+
+    # Relationship cues
+    # Personal providers can indicate 1:1 email; keep modest (can be noisy).
+    if domain in {"gmail.com", "icloud.com", "me.com", "mac.com", "yahoo.com", "outlook.com", "hotmail.com", "proton.me", "protonmail.com"}:
+        score += 6
+    # Reply-To sometimes indicates a real human workflow.
+    if (email.get("reply_to") or "").strip():
         score += 5
 
-    return max(0, min(100, score))
+    # Subject prefix (suggesting existing workflow --> higher importance)
+    if subj_l.startswith("re:"):
+        score += 6
+    if subj_l.startswith("fwd:") or subj_l.startswith("fw:"):
+        score += 4
+
+    # Recency heuristic (more recent --> more important)
+    dt = _parsed_date(email.get("date", ""))
+    if dt:
+        age = _utcnow() - dt
+        if age <= timedelta(hours=3):
+            score += 10
+        elif age <= timedelta(hours=12):
+            score += 6
+        elif age <= timedelta(days=1):
+            score += 2
+        elif age >= timedelta(days=7):
+            score -= 8
+
+    # Snippet Length (Shorter snippets likely not as crucial)
+    if len(snippet) > 240:
+        score += 4
+    elif len(snippet) < 40:
+        score -= 3
+
+    return _clamp(score, 0, 100)
+
+
+# LLM Ranking + Replies 
 
 
 def llm_rank_and_reply(cohere_client: cohere.Client, fact_profile: str, email: dict) -> dict:

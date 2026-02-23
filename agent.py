@@ -76,11 +76,6 @@ def load_profile(path: str = PROFILE_PATH) -> str:
     except FileNotFoundError:
         # Safe default: empty profile
         return ""
-    
-
-def load_profile(path: str = PROFILE_PATH) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
 
 
 def gmail_service():
@@ -111,9 +106,13 @@ def gmail_service():
 
 def load_state() -> dict:
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_run_utc": None}
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            # corrupted state -> reset
+            return {"last_run_utc": None, "llm_cache": {}}
+    return {"last_run_utc": None, "llm_cache": {}}
 
 
 def save_state(state: dict):
@@ -123,22 +122,34 @@ def save_state(state: dict):
 
 def list_unread_messages(service, max_results: int = 10):
     """
-    Query for unread messages:
-      - is:unread
-      - optionally: newer_than:1d
-    You can tune this based on your needs.
+    Query for unread messages.
+    Controlled by env var QUERY. Default: "is:unread newer_than:1d"
     """
-    query = "is:unread newer_than:1d"
     resp = (
         service.users()
         .messages()
-        .list(userId="me", q=query, maxResults=max_results)
+        .list(userId="me", q=QUERY, maxResults=max_results)
         .execute()
     )
     return resp.get("messages", [])
 
 
 def get_message_details(service, msg_id: str) -> dict:
+    # Pull many metadata headers to strengthen heuristics (e.g., bulk/spam detection)
+    hdrs = [
+        "From",
+        "To",
+        "Cc",
+        "Subject",
+        "Date",
+        "Message-Id",
+        "Reply-To",
+        "List-Unsubscribe",
+        "Precedence",
+        "Auto-Submitted",
+        "X-Auto-Response-Suppress",
+    ]
+
     msg = (
         service.users()
         .messages()
@@ -146,7 +157,7 @@ def get_message_details(service, msg_id: str) -> dict:
             userId="me",
             id=msg_id,
             format="metadata",
-            metadataHeaders=["From", "To", "Subject", "Date", "Message-Id"],
+            metadataHeaders=hdrs,
         )
         .execute()
     )
@@ -157,14 +168,63 @@ def get_message_details(service, msg_id: str) -> dict:
     return {
         "id": msg_id,
         "threadId": msg.get("threadId"),
+        "labelIds": msg.get("labelIds", []),
         "from": headers.get("From", ""),
         "to": headers.get("To", ""),
+        "cc": headers.get("Cc", ""),
+        "reply_to": headers.get("Reply-To", ""),
         "subject": headers.get("Subject", ""),
         "date": headers.get("Date", ""),
         "message_id": headers.get("Message-Id", ""),
+        "list_unsubscribe": headers.get("List-Unsubscribe", ""),
+        "precedence": headers.get("Precedence", ""),
+        "auto_submitted": headers.get("Auto-Submitted", ""),
+        "x_auto_response_suppress": headers.get("X-Auto-Response-Suppress", ""),
         "snippet": snippet,
     }
 
+def create_draft(service, to_email: str, subject: str, body: str) -> dict:
+    """
+    Create a Gmail draft with a simple MIME message.
+    """
+    message = EmailMessage()
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    draft_body = {"message": {"raw": raw}}
+    return service.users().drafts().create(userId="me", body=draft_body).execute()
+
+
+def parse_from_header(from_header: str) -> str:
+    """
+    Very rough extraction: if 'Name <email@x.com>' -> 'email@x.com'
+    """
+    if "<" in from_header and ">" in from_header:
+        return from_header.split("<", 1)[1].split(">", 1)[0].strip()
+    return from_header.strip()
+
+
+def _sender_domain(addr: str) -> str:
+    addr = parse_from_header(addr)
+    if "@" in addr:
+        return addr.split("@", 1)[1].lower().strip()
+    return ""
+
+
+def _parsed_date(email_date: str) -> Optional[datetime]:
+    if not email_date:
+        return None
+    try:
+        dt = parsedate_to_datetime(email_date)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+    
+# Heuristic as backup for LLM-generated ranking 
 
 def heuristic_importance(email: dict) -> int:
     """
@@ -246,22 +306,6 @@ importance (int), category (str), reply_subject (str), reply_body (str)
     data["reply_body"] = data.get("reply_body") or "Thanks—received."
 
     return data
-
-
-def create_draft(service, to_email: str, subject: str, body: str) -> dict:
-    """
-    Create a Gmail draft with a simple MIME message.
-    """
-    message = EmailMessage()
-    message["To"] = to_email
-    message["Subject"] = subject
-    message.set_content(body)
-
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-
-    draft_body = {"message": {"raw": raw}}
-    draft = service.users().drafts().create(userId="me", body=draft_body).execute()
-    return draft
 
 
 def parse_from_header(from_header: str) -> str:

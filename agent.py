@@ -1,14 +1,20 @@
+
 import os
 import json
 import base64
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
 
 import cohere
 
@@ -29,10 +35,48 @@ PROFILE_PATH = "profile.txt"
 # Configurable credential path (recommended so credentials can live outside repo)
 CREDS_PATH = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "credentials.json")
 
-# (Optional) dry-run mode (do not create drafts; just print what would happen)
-# Supports: export DRY_RUN=1 (or true/yes/on)
-DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+# Tags / runtime controls
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+DRY_RUN = _env_flag("DRY_RUN", "0")  # do not create drafts; print what would happen
+DEBUG = _env_flag("DEBUG", "0")      # extra logs
+FORCE_HEURISTIC_ONLY = _env_flag("FORCE_HEURISTIC_ONLY", "0")  # skip LLM even if key exists
+
+CREATE_DRAFTS = _env_flag("CREATE_DRAFTS", "1")  # allows turning off draft creation without DRY_RUN
+MIN_IMPORTANCE_TO_DRAFT = int(os.getenv("MIN_IMPORTANCE_TO_DRAFT", "0"))  # e.g., 40
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
+QUERY = os.getenv("QUERY", "is:unread newer_than:1d")
+
+OUTPUT_JSON_PATH = os.getenv("OUTPUT_JSON_PATH", "").strip()  # if set, writes run summary JSON
+CACHE_TTL_HOURS = float(os.getenv("CACHE_TTL_HOURS", "24"))   # cache LLM results per message-id
+
+# Utilities 
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
+    return max(lo, min(hi, n))
+
+def _debug(msg: str):
+    if DEBUG:
+        print(f"[DEBUG] {msg}")
+
+def load_profile(path: str = PROFILE_PATH) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        # Safe default: empty profile
+        return ""
+    
 
 def load_profile(path: str = PROFILE_PATH) -> str:
     with open(path, "r", encoding="utf-8") as f:

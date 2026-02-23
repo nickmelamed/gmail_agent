@@ -1,14 +1,20 @@
+
 import os
 import json
 import base64
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
 
 import cohere
 
@@ -29,14 +35,47 @@ PROFILE_PATH = "profile.txt"
 # Configurable credential path (recommended so credentials can live outside repo)
 CREDS_PATH = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "credentials.json")
 
-# (Optional) dry-run mode (do not create drafts; just print what would happen)
-# Supports: export DRY_RUN=1 (or true/yes/on)
-DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+# Tags / runtime controls
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+DRY_RUN = _env_flag("DRY_RUN", "0")  # do not create drafts; print what would happen
+DEBUG = _env_flag("DEBUG", "0")      # extra logs
+FORCE_HEURISTIC_ONLY = _env_flag("FORCE_HEURISTIC_ONLY", "0")  # skip LLM even if key exists
+
+CREATE_DRAFTS = _env_flag("CREATE_DRAFTS", "1")  # allows turning off draft creation without DRY_RUN
+MIN_IMPORTANCE_TO_DRAFT = int(os.getenv("MIN_IMPORTANCE_TO_DRAFT", "0"))  # e.g., 40
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
+QUERY = os.getenv("QUERY", "is:unread newer_than:1d")
+
+OUTPUT_JSON_PATH = os.getenv("OUTPUT_JSON_PATH", "").strip()  # if set, writes run summary JSON
+CACHE_TTL_HOURS = float(os.getenv("CACHE_TTL_HOURS", "24"))   # cache LLM results per message-id
+
+# Utilities 
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
+    return max(lo, min(hi, n))
+
+def _debug(msg: str):
+    if DEBUG:
+        print(f"[DEBUG] {msg}")
 
 def load_profile(path: str = PROFILE_PATH) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        # Safe default: empty profile
+        return ""
 
 
 def gmail_service():
@@ -67,9 +106,13 @@ def gmail_service():
 
 def load_state() -> dict:
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_run_utc": None}
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            # corrupted state -> reset
+            return {"last_run_utc": None, "llm_cache": {}}
+    return {"last_run_utc": None, "llm_cache": {}}
 
 
 def save_state(state: dict):
@@ -79,22 +122,34 @@ def save_state(state: dict):
 
 def list_unread_messages(service, max_results: int = 10):
     """
-    Query for unread messages:
-      - is:unread
-      - optionally: newer_than:1d
-    You can tune this based on your needs.
+    Query for unread messages.
+    Controlled by env var QUERY. Default: "is:unread newer_than:1d"
     """
-    query = "is:unread newer_than:1d"
     resp = (
         service.users()
         .messages()
-        .list(userId="me", q=query, maxResults=max_results)
+        .list(userId="me", q=QUERY, maxResults=max_results)
         .execute()
     )
     return resp.get("messages", [])
 
 
 def get_message_details(service, msg_id: str) -> dict:
+    # Pull many metadata headers to strengthen heuristics (e.g., bulk/spam detection)
+    hdrs = [
+        "From",
+        "To",
+        "Cc",
+        "Subject",
+        "Date",
+        "Message-Id",
+        "Reply-To",
+        "List-Unsubscribe",
+        "Precedence",
+        "Auto-Submitted",
+        "X-Auto-Response-Suppress",
+    ]
+
     msg = (
         service.users()
         .messages()
@@ -102,7 +157,7 @@ def get_message_details(service, msg_id: str) -> dict:
             userId="me",
             id=msg_id,
             format="metadata",
-            metadataHeaders=["From", "To", "Subject", "Date", "Message-Id"],
+            metadataHeaders=hdrs,
         )
         .execute()
     )
@@ -113,31 +168,150 @@ def get_message_details(service, msg_id: str) -> dict:
     return {
         "id": msg_id,
         "threadId": msg.get("threadId"),
+        "labelIds": msg.get("labelIds", []),
         "from": headers.get("From", ""),
         "to": headers.get("To", ""),
+        "cc": headers.get("Cc", ""),
+        "reply_to": headers.get("Reply-To", ""),
         "subject": headers.get("Subject", ""),
         "date": headers.get("Date", ""),
         "message_id": headers.get("Message-Id", ""),
+        "list_unsubscribe": headers.get("List-Unsubscribe", ""),
+        "precedence": headers.get("Precedence", ""),
+        "auto_submitted": headers.get("Auto-Submitted", ""),
+        "x_auto_response_suppress": headers.get("X-Auto-Response-Suppress", ""),
         "snippet": snippet,
     }
 
+def create_draft(service, to_email: str, subject: str, body: str) -> dict:
+    """
+    Create a Gmail draft with a simple MIME message.
+    """
+    message = EmailMessage()
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    draft_body = {"message": {"raw": raw}}
+    return service.users().drafts().create(userId="me", body=draft_body).execute()
+
+
+def parse_from_header(from_header: str) -> str:
+    """
+    Very rough extraction: if 'Name <email@x.com>' -> 'email@x.com'
+    """
+    if "<" in from_header and ">" in from_header:
+        return from_header.split("<", 1)[1].split(">", 1)[0].strip()
+    return from_header.strip()
+
+
+def _sender_domain(addr: str) -> str:
+    addr = parse_from_header(addr)
+    if "@" in addr:
+        return addr.split("@", 1)[1].lower().strip()
+    return ""
+
+
+def _parsed_date(email_date: str) -> Optional[datetime]:
+    if not email_date:
+        return None
+    try:
+        dt = parsedate_to_datetime(email_date)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+    
+# Heuristic as backup for LLM-generated ranking 
 
 def heuristic_importance(email: dict) -> int:
     """
-    Baseline heuristic ranking of an email.
-    Used in event of failure of LLM ranking
-    """
-    score = 10
-    subj = (email.get("subject") or "").lower()
-    sender = (email.get("from") or "").lower()
+    Robust baseline heuristic importance score (0-100).
+    Designed to be a strong fallback if the LLM fails.
 
-    if any(w in subj for w in ["urgent", "asap", "immediately", "action required"]):
-        score += 40
-    if any(w in subj for w in ["invoice", "payment", "overdue", "receipt"]):
+    Signals used (metadata-only):
+    - Urgency/action keywords
+    - Finance/invoice/payment/legal
+    - Scheduling/meeting/interview
+    - Security/auth/verification codes
+    - Bulk/list email indicators (List-Unsubscribe, Precedence, noreply, etc.)
+    - Sender relationship cues (reply-to present, personal email providers, etc.)
+    - Recency (hours since received)
+    - Thread/reply prefixes
+    - Length-ish via snippet length
+    """
+    subj = (email.get("subject") or "").strip()
+    subj_l = subj.lower()
+    sender = (email.get("from") or "")
+    sender_l = sender.lower()
+    snippet = (email.get("snippet") or "")
+    snippet_l = snippet.lower()
+    domain = _sender_domain(sender)
+
+    # Start relatively low for potential for up/down adjustments
+    score = 35
+
+    # Downrank bulk/spam-like patterns 
+    bulk_hits = 0
+    if "list-unsubscribe" in (email.get("list_unsubscribe") or "").lower():
+        bulk_hits += 2
+    if any(k in (email.get("precedence") or "").lower() for k in ["bulk", "list", "junk"]):
+        bulk_hits += 2
+    if any(k in (email.get("auto_submitted") or "").lower() for k in ["auto", "generated"]):
+        bulk_hits += 1
+    if any(k in sender_l for k in ["no-reply", "noreply", "donotreply"]):
+        bulk_hits += 2
+    if any(k in domain for k in ["mail.", "mailer.", "news.", "marketing.", "bounce."]):
+        bulk_hits += 1
+
+    # Promotional language
+    if any(k in subj_l for k in ["sale", "deal", "promo", "promotion", "newsletter", "unsubscribe"]):
+        bulk_hits += 1
+
+    if bulk_hits >= 4:
+        score -= 35
+    elif bulk_hits == 3:
+        score -= 25
+    elif bulk_hits == 2:
+        score -= 15
+    elif bulk_hits == 1:
+        score -= 8
+
+    # Uprank urgency (e.g., "Action Required")
+    if any(w in subj_l for w in ["urgent", "asap", "immediately", "action required", "time sensitive", "final notice"]):
+        score += 28
+    if any(w in snippet_l for w in ["action required", "please respond", "need your response", "reply by", "deadline"]):
+        score += 12
+
+    # Uprank Financial/Legal
+    if any(w in subj_l for w in ["invoice", "payment", "overdue", "receipt", "bill", "past due", "wire", "refund"]):
+        score += 22
+    if any(w in subj_l for w in ["contract", "agreement", "legal", "nda", "tax", "1099", "w-2"]):
+        score += 18
+    if any(w in snippet_l for w in ["amount due", "past due", "suspension", "collections"]):
+        score += 10
+
+    # Uprank Scheduling/Meeting/Interview
+    if any(w in subj_l for w in ["meeting", "calendar", "schedule", "reschedule", "interview", "availability", "call"]):
+        score += 16
+    if any(w in snippet_l for w in ["zoom", "google meet", "teams", "calendar invite"]):
+        score += 8
+
+    # Security/Verification 
+    # These are often important but not reply-worthy; still high importance so user sees them.
+    if any(w in subj_l for w in ["verification code", "security alert", "password reset", "new sign-in", "suspicious"]):
         score += 25
-    if any(w in sender for w in ["boss@", "advisor@", "prof@", "principal@"]):
+    if re.search(r"\b\d{6}\b", snippet) and any(w in snippet_l for w in ["code", "verification", "otp", "2fa"]):
         score += 20
-    if len(email.get("snippet", "")) > 200:
+
+    # Relationship cues
+    # Personal providers can indicate 1:1 email; keep modest (can be noisy).
+    if domain in {"gmail.com", "icloud.com", "me.com", "mac.com", "yahoo.com", "outlook.com", "hotmail.com", "proton.me", "protonmail.com"}:
+        score += 6
+    # Reply-To sometimes indicates a real human workflow.
+    if (email.get("reply_to") or "").strip():
         score += 5
 
     # Subject prefix (suggesting existing workflow --> higher importance)

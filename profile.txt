@@ -1,9 +1,9 @@
 Name: Nick Melamed
 Role: Graduate student at UC Berkeley (MIDS)
 Professional Focus:
-- AI model evaluation & LLM-as-a-Judge research
-- Computer vision & robotics (FRC Team 1515)
-- AI-driven due diligence and investment tooling
+- AI model evaluation
+- Computer Vision, Perception & Robotics
+- AI-driven tooling
 - Applied ML systems bridging technical rigor and business impact
 
 Tone: Concise, professional, friendly

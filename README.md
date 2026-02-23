@@ -1,4 +1,4 @@
-# Daily Gmail Inbox Checking Agent (Proof of Concept)
+# Gmail Inbox Rank-and-Reply Agent (Proof of Concept)
 
 This repository contains a local, human-in-the-loop AI agent that prioritizes unread emails and generates draft replies using an LLM (Cohere).
 

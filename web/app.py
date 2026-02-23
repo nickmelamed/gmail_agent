@@ -49,9 +49,63 @@ def gmail_service(creds: Credentials):
 @app.get("/")
 def home():
     return """
-    <h2>Daily Inbox Agent (POC)</h2>
-    <a href="/login">Sign in with Google</a><br/>
-    <a href="/run">Run triage</a>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Gmail Inbox Rank-And-Reply Agent</title>
+        <style>
+            body {
+                margin: 0;
+                height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                background-color: #1e3a8a; /* deep blue */
+                font-family: Arial, sans-serif;
+                color: white;
+            }
+
+            .container {
+                text-align: center;
+                background-color: rgba(255, 255, 255, 0.1);
+                padding: 50px 70px;
+                border-radius: 20px;
+                backdrop-filter: blur(8px);
+                box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+            }
+
+            h1 {
+                font-size: 2.8rem;
+                margin-bottom: 30px;
+            }
+
+            a {
+                display: inline-block;
+                margin: 15px 0;
+                padding: 15px 30px;
+                font-size: 1.2rem;
+                text-decoration: none;
+                color: #1e3a8a;
+                background-color: white;
+                border-radius: 30px;
+                font-weight: bold;
+                transition: 0.3s ease;
+            }
+
+            a:hover {
+                background-color: #e5e7eb;
+                transform: scale(1.05);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Gmail Inbox Rank-and-Reply Agent (POC)</h1>
+            <a href="/login">Sign in with Google</a><br/>
+            <a href="/run">Run Unread Email Triage</a>
+        </div>
+    </body>
+    </html>
     """
 
 @app.get("/login")

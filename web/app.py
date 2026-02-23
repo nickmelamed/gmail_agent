@@ -102,7 +102,7 @@ def home():
         <div class="container">
             <h1>Gmail Inbox Rank-and-Reply Agent (POC)</h1>
             <a href="/login">Sign in with Google</a><br/>
-            <a href="/run">Run Triage</a>
+            <a href="/run">Run Unread Email Triage</a>
         </div>
     </body>
     </html>

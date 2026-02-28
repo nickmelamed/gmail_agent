@@ -1,10 +1,8 @@
-# Gmail Inbox Rank-and-Reply Agent (Proof of Concept)
+# Gmail Inbox Rank-and-Reply Agent
 
 This repository contains a local, human-in-the-loop AI agent that prioritizes unread emails and generates draft replies using an LLM (Cohere).
 
 The goal is to reduce inbox time by automating your email-checking experience into a simple review-and-send workflow. 
-
-This is a proof of concept, but it is fully functional and intentionally designed to be safe (no auto-sending).
 
 ---
 

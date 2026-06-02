@@ -10,8 +10,6 @@ from googleapiclient.discovery import build
 from google.cloud import firestore
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-
 from rank_reply import extract_body
 from core import process_email, create_draft as make_draft
 
@@ -25,7 +23,8 @@ SCOPES = [
 ]
 
 GOOGLE_OAUTH_CLIENT_JSON = json.loads(os.environ["GOOGLE_OAUTH_CLIENT_JSON"])
-DEFAULT_PROFILE_PATH = ROOT_DIR / "profile.txt"
+_here = Path(__file__).resolve().parent
+DEFAULT_PROFILE_PATH = _here / "profile.txt" if (_here / "profile.txt").exists() else _here.parent / "profile.txt"
 MIN_IMPORTANCE_TO_DRAFT = int(os.getenv("MIN_IMPORTANCE_TO_DRAFT", "0"))
 
 db = firestore.Client()

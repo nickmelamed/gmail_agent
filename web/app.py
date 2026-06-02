@@ -1,6 +1,5 @@
 import os
 import json
-import sys
 from pathlib import Path
 from flask import Flask, redirect, request, session, url_for
 
@@ -12,8 +11,6 @@ from google.cloud import firestore
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from rank_reply import extract_body
 from core import process_email, create_draft as make_draft

@@ -5,9 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY web/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Shared modules from project root
+COPY rank_reply.py core.py profile_schema.py tools.py profile.txt ./
+
+# Web app
+COPY web/ .
 
 CMD ["gunicorn", "-b", ":8080", "app:app"]

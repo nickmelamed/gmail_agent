@@ -6,6 +6,7 @@
 # Python
 *__pycache__/
 *.venv/
+gmail_agent/
 
 # Checkpoint files 
 *.ipynb_checkpoints 

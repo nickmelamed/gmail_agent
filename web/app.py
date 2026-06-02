@@ -1,23 +1,22 @@
 import os
 import json
-import base64
 import sys
 from pathlib import Path
 from flask import Flask, redirect, request, session, url_for
 
-import cohere
+import anthropic
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.cloud import firestore
-from email.message import EmailMessage
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from rank_reply import llm_rank_and_reply, load_profile
+from rank_reply import extract_body
+from core import process_email, create_draft as make_draft
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
@@ -28,11 +27,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 
-# Store your OAuth web client JSON in env var/Secret Manager 
 GOOGLE_OAUTH_CLIENT_JSON = json.loads(os.environ["GOOGLE_OAUTH_CLIENT_JSON"])
+DEFAULT_PROFILE_PATH = ROOT_DIR / "profile.txt"
+MIN_IMPORTANCE_TO_DRAFT = int(os.getenv("MIN_IMPORTANCE_TO_DRAFT", "0"))
 
 db = firestore.Client()
-co = cohere.Client(os.environ["COHERE_API_KEY"])
+claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
 
 def save_creds(user_key: str, creds: Credentials):
     db.collection("gmail_tokens").document(user_key).set({
@@ -54,6 +55,16 @@ def load_creds(user_key: str) -> Credentials | None:
 def gmail_service(creds: Credentials):
     return build("gmail", "v1", credentials=creds)
 
+def load_user_profile(user_key: str) -> str:
+    doc = db.collection("user_profiles").document(user_key).get()
+    if doc.exists:
+        return doc.to_dict().get("profile_text", "")
+    return DEFAULT_PROFILE_PATH.read_text(encoding="utf-8")
+
+def save_user_profile(user_key: str, profile_text: str):
+    db.collection("user_profiles").document(user_key).set({"profile_text": profile_text})
+
+
 @app.get("/")
 def home():
     return """
@@ -68,11 +79,10 @@ def home():
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                background-color: #1e3a8a; /* deep blue */
+                background-color: #1e3a8a;
                 font-family: Arial, sans-serif;
                 color: white;
             }
-
             .container {
                 text-align: center;
                 background-color: rgba(255, 255, 255, 0.1);
@@ -81,12 +91,7 @@ def home():
                 backdrop-filter: blur(8px);
                 box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
             }
-
-            h1 {
-                font-size: 2.8rem;
-                margin-bottom: 30px;
-            }
-
+            h1 { font-size: 2.8rem; margin-bottom: 30px; }
             a {
                 display: inline-block;
                 margin: 15px 0;
@@ -99,18 +104,15 @@ def home():
                 font-weight: bold;
                 transition: 0.3s ease;
             }
-
-            a:hover {
-                background-color: #e5e7eb;
-                transform: scale(1.05);
-            }
+            a:hover { background-color: #e5e7eb; transform: scale(1.05); }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>Gmail Inbox Rank-and-Reply Agent (POC)</h1>
             <a href="/login">Sign in with Google</a><br/>
-            <a href="/run">Run Unread Email Triage</a>
+            <a href="/run">Run Unread Email Triage</a><br/>
+            <a href="/profile">Edit Your Profile</a>
         </div>
     </body>
     </html>
@@ -142,7 +144,6 @@ def oauth2callback():
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
 
-    # Session-based user
     user_key = session.get("user_key") or request.remote_addr
     session["user_key"] = user_key
     save_creds(user_key, creds)
@@ -157,43 +158,82 @@ def run_agent():
         return redirect("/login")
 
     svc = gmail_service(creds)
-    fact_profile = load_profile()
+    fact_profile = load_user_profile(user_key)
 
-    # list unread emails 
     resp = svc.users().messages().list(userId="me", q="is:unread newer_than:1d", maxResults=10).execute()
     messages = resp.get("messages", [])
 
-    # for each message: fetch metadata + draft response
     drafted = 0
     for m in messages:
-        msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
-                                         metadataHeaders=["From","Subject","Date"]).execute()
+        msg = svc.users().messages().get(
+            userId="me", id=m["id"], format="full",
+            metadataHeaders=["From", "To", "Subject", "Date", "List-Unsubscribe", "Precedence"]
+        ).execute()
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-        sender = headers.get("From","")
-        subject = headers.get("Subject","")
-        date = headers.get("Date","")
-        snippet = msg.get("snippet","")
-
-        llm = llm_rank_and_reply(
-            co,
-            fact_profile,
-            {
-                "from": sender,
-                "subject": subject,
-                "date": date,
-                "snippet": snippet,
-            },
-        )
-        reply_subject = llm["reply_subject"]
-        reply_body = llm["reply_body"]
-
-        # Create Gmail draft
-        em = EmailMessage()
-        em["To"] = sender
-        em["Subject"] = reply_subject
-        em.set_content(reply_body)
-        raw = base64.urlsafe_b64encode(em.as_bytes()).decode("utf-8")
-        svc.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
-        drafted += 1
+        email = {
+            "id": m["id"],
+            "threadId": msg.get("threadId"),
+            "from": headers.get("From", ""),
+            "to": headers.get("To", ""),
+            "subject": headers.get("Subject", ""),
+            "date": headers.get("Date", ""),
+            "snippet": msg.get("snippet", ""),
+            "body": extract_body(msg.get("payload", {}))[:3000],
+            "list_unsubscribe": headers.get("List-Unsubscribe", ""),
+            "precedence": headers.get("Precedence", ""),
+        }
+        result = process_email(claude, fact_profile, email, min_importance=MIN_IMPORTANCE_TO_DRAFT)
+        if result["should_draft"]:
+            make_draft(svc, result["to_email"], result["reply_subject"], result["reply_body"])
+            drafted += 1
 
     return f"Drafted {drafted} replies. Check Gmail -> Drafts."
+
+
+@app.get("/profile")
+def profile_get():
+    user_key = session.get("user_key") or request.remote_addr
+    profile_text = load_user_profile(user_key)
+    saved = request.args.get("saved") == "1"
+    escaped = profile_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    saved_banner = '<p style="color:#86efac;">Profile saved.</p>' if saved else ""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Edit Your Profile</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; background: #1e3a8a; color: white;
+                display: flex; justify-content: center; padding: 40px; }}
+        .card {{ background: rgba(255,255,255,0.1); border-radius: 16px;
+                 padding: 40px; width: 680px; backdrop-filter: blur(8px); }}
+        h2 {{ margin-top: 0; }}
+        textarea {{ width: 100%; height: 380px; padding: 12px; border-radius: 8px;
+                    border: none; font-family: monospace; font-size: 0.9rem; box-sizing: border-box; }}
+        button {{ margin-top: 16px; padding: 12px 28px; background: white; color: #1e3a8a;
+                  border: none; border-radius: 24px; font-weight: bold;
+                  font-size: 1rem; cursor: pointer; }}
+        a {{ color: #93c5fd; }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2>Your Email Profile</h2>
+        <p>This profile is used to personalize reply tone, style, and decision rules.</p>
+        {saved_banner}
+        <form method="POST" action="/profile">
+          <textarea name="profile_text">{escaped}</textarea><br/>
+          <button type="submit">Save Profile</button>
+        </form>
+        <p><a href="/">&#8592; Back to home</a></p>
+      </div>
+    </body>
+    </html>
+    """
+
+@app.post("/profile")
+def profile_post():
+    user_key = session.get("user_key") or request.remote_addr
+    profile_text = request.form.get("profile_text", "")
+    save_user_profile(user_key, profile_text)
+    return redirect("/profile?saved=1")

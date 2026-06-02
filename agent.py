@@ -1,10 +1,7 @@
 
 import os
 import json
-import base64
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from email.message import EmailMessage
+from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
@@ -13,9 +10,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-
-import cohere
-from rank_reply import heuristic_importance, llm_rank_and_reply, load_profile
+import anthropic
+from rank_reply import load_profile, get_full_body
+from core import process_email, create_draft
 
 # Load .env if present (local dev / teammate setup)
 load_dotenv()
@@ -50,19 +47,10 @@ QUERY = os.getenv("QUERY", "is:unread newer_than:1d")
 OUTPUT_JSON_PATH = os.getenv("OUTPUT_JSON_PATH", "").strip()  # if set, writes run summary JSON
 CACHE_TTL_HOURS = float(os.getenv("CACHE_TTL_HOURS", "24"))   # cache LLM results per message-id
 
-# Utilities 
+# Utilities
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
-    return max(lo, min(hi, n))
 
 def _debug(msg: str):
     if DEBUG:
@@ -101,7 +89,6 @@ def load_state() -> dict:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            # corrupted state -> reset
             return {"last_run_utc": None, "llm_cache": {}}
     return {"last_run_utc": None, "llm_cache": {}}
 
@@ -174,41 +161,8 @@ def get_message_details(service, msg_id: str) -> dict:
         "snippet": snippet,
     }
 
-def create_draft(service, to_email: str, subject: str, body: str) -> dict:
-    """
-    Create a Gmail draft with a simple MIME message.
-    """
-    message = EmailMessage()
-    message["To"] = to_email
-    message["Subject"] = subject
-    message.set_content(body)
-
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-    draft_body = {"message": {"raw": raw}}
-    return service.users().drafts().create(userId="me", body=draft_body).execute()
-
-
-def parse_from_header(from_header: str) -> str:
-    """
-    Very rough extraction: if 'Name <email@x.com>' -> 'email@x.com'
-    """
-    if "<" in from_header and ">" in from_header:
-        return from_header.split("<", 1)[1].split(">", 1)[0].strip()
-    return from_header.strip()
-
-
-def _sender_domain(addr: str) -> str:
-    addr = parse_from_header(addr)
-    if "@" in addr:
-        return addr.split("@", 1)[1].lower().strip()
-    return ""
-
 
 def _cache_key(email: dict) -> str:
-    """
-    Cache key should change if the email meaningfully changes.
-    Metadata-only fetches can vary; include stable-ish fields.
-    """
     parts = [
         str(email.get("id", "")),
         str(email.get("threadId", "")),
@@ -216,7 +170,7 @@ def _cache_key(email: dict) -> str:
         str(email.get("from", "")),
         str(email.get("subject", "")),
         str(email.get("date", "")),
-        str(email.get("snippet", ""))[:400],  # cap to keep key small
+        str(email.get("snippet", ""))[:400],
     ]
     return "||".join(parts)
 
@@ -240,30 +194,15 @@ def _cache_get(state: dict, key: str) -> Optional[dict]:
         return None
 
     data = item.get("data")
-    return data if isinstance(data, dict) else None
+    # Only accept cached entries in the new process_email result format
+    if isinstance(data, dict) and "should_draft" in data:
+        return data
+    return None
 
 
 def _cache_put(state: dict, key: str, data: dict):
     state.setdefault("llm_cache", {})
     state["llm_cache"][key] = {"ts_utc": _utcnow().isoformat(), "data": data}
-
-
-def _is_spam_like(category: str, email: dict) -> bool:
-    """
-    Conservative spam-like check: either LLM says spam-like, or heuristic bulk indicators are strong.
-    """
-    cat = (category or "").strip().lower()
-    if cat in {"spam", "spam-like", "promotion", "promotional", "newsletter"}:
-        return True
-
-    # If list-unsubscribe/preference flags are present, treat as spam-like for drafting
-    if "list-unsubscribe" in (email.get("list_unsubscribe") or "").lower():
-        return True
-
-    if any(k in (email.get("precedence") or "").lower() for k in ["bulk", "list", "junk"]):
-        return True
-
-    return False
 
 
 def main():
@@ -272,12 +211,12 @@ def main():
 
     service = gmail_service()
 
-    cohere_key = os.getenv("COHERE_API_KEY")
-    cohere_client = cohere.Client(cohere_key) if (cohere_key and not FORCE_HEURISTIC_ONLY) else None
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if (ANTHROPIC_API_KEY and not FORCE_HEURISTIC_ONLY) else None
 
-    if not cohere_key:
-        print("Warning: COHERE_API_KEY is not set. Falling back to heuristic ranking + generic replies.")
-    if FORCE_HEURISTIC_ONLY and cohere_key:
+    if not ANTHROPIC_API_KEY:
+        print("Warning: ANTHROPIC_API_KEY is not set. Falling back to heuristic ranking + generic replies.")
+    if FORCE_HEURISTIC_ONLY and ANTHROPIC_API_KEY:
         print("FORCE_HEURISTIC_ONLY=1: Skipping LLM calls; using heuristic ranking + generic replies.")
 
     msgs = list_unread_messages(service, max_results=MAX_RESULTS)
@@ -289,36 +228,29 @@ def main():
 
     emails = [get_message_details(service, m["id"]) for m in msgs]
 
+    # Fetch full body for each email
+    for e in emails:
+        body = get_full_body(service, e["id"])
+        e["body"] = body[:3000]
+
     results = []
     for e in emails:
-        base_score = heuristic_importance(e)
-
-        # LLM with caching
         cache_key = _cache_key(e)
-        cached = _cache_get(state, cache_key) if cohere_client else None
+        cached = _cache_get(state, cache_key) if claude_client else None
 
         if cached:
-            llm = cached
-        elif cohere_client:
-            llm = llm_rank_and_reply(cohere_client, fact_profile, e)
-            _cache_put(state, cache_key, llm)
+            result = cached
         else:
-            llm = None
+            result = process_email(claude_client, fact_profile, e, min_importance=MIN_IMPORTANCE_TO_DRAFT)
+            if claude_client:
+                _cache_put(state, cache_key, result)
 
-        if llm:
-            importance = _clamp(_safe_int(llm.get("importance", base_score)), 0, 100)
-            category = (llm.get("category") or "unknown").strip()
-            reply_subject = (llm.get("reply_subject") or f"Re: {e.get('subject','')}".strip()).strip()
-            reply_body = (llm.get("reply_body") or "Thanks—received.").strip()
-        else:
-            importance = base_score
-            category = "unknown"
-            reply_subject = f"Re: {e.get('subject','')}".strip()
-            reply_body = "Thanks for the email—received. What would you like me to do next?"
-
-        to_email = parse_from_header(e.get("from", ""))
-
-        should_draft = (importance >= MIN_IMPORTANCE_TO_DRAFT) and (not _is_spam_like(category, e))
+        to_email = result["to_email"]
+        reply_subject = result["reply_subject"]
+        reply_body = result["reply_body"]
+        importance = result["importance"]
+        category = result["category"]
+        should_draft = result["should_draft"]
 
         if DRY_RUN or (not CREATE_DRAFTS) or (not should_draft):
             draft_id = None
